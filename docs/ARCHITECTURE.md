@@ -52,7 +52,7 @@ The Web UI is a static page served by the Cloud API. It can be operated from any
 │  │   OpenClaw Agent (Target) │   │  Observer Plugin      │   │
 │  │                           │   │  :18790               │   │
 │  │  LLM-powered AI Agent     │   │                       │   │
-│  │  --session-id <sess>      ├──►│  current_run_id (file)│   │
+│  │  --session-id <key>     ├──►│  runs/{oc_session}/   │   │
 │  │  --message <user_goal>    │   │  events.jsonl         │   │
 │  │                           │   │                       │   │
 │  │  ┌─────┐ ┌──────────────┐ │   │  hooks:               │   │
@@ -62,6 +62,65 @@ The Web UI is a static page served by the Cloud API. It can be operated from any
 │  └───────────────────────────┘   └───────────────────────┘   │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Key Concepts
+
+### `run_id` vs `oc_session` — Two IDs, Two Worlds
+
+The system has two independent namespaces that must be bridged at runtime:
+
+| ID | Owner | Format | Purpose |
+|---|---|---|---|
+| `run_id` (= `session_id`) | Our system | UUID `a3f2b1c0-…` | Primary key for the `attack_sessions` DB row |
+| `oc_session` | OpenClaw | Human-readable key `MEMORY-EXTRACT-001` | `--session-id` argument passed to `openclaw agent` |
+
+**Why both exist:**
+
+- `oc_session` must be human-readable — it is the CLI argument and the filename openclaw uses to store conversation history. It cannot be a UUID.
+- Our DB primary key (`run_id`) is a UUID generated at INSERT time. It does not exist yet when `openclaw agent` is launched.
+- OpenClaw's plugin hooks (`before_tool_call`, `after_tool_call`, `llm_output`) fire inside the OpenClaw process and only know the `oc_session` name. They have no mechanism to receive or forward our system's UUID at runtime.
+
+**The bridge — `runs/{oc_session}` file:**
+
+Before each attack run, the Attack Agent registers both IDs with the Observer Plugin via `POST /run/start`. The plugin writes the `run_id` to a file at `runs/{oc_session}`. When hooks fire, the plugin reads that file and stamps every event with `attack_run_id = run_id`. The Attack Agent can then match collected events back to the correct DB session.
+
+```
+Attack Agent                       Observer Plugin              OpenClaw (hooks)
+     │                                   │                           │
+     │  POST /run/start                  │                           │
+     │  { run_id: "a3f2-...",            │                           │
+     │    oc_session: "MEMORY-001" }     │                           │
+     │ ────────────────────────────────► │                           │
+     │                                   │ write "a3f2-..."          │
+     │                                   │ → runs/MEMORY-001 file    │
+     │                                   │                           │
+     │  $ openclaw agent                 │                           │
+     │    --session-id MEMORY-001 ...    │                           │
+     │ ──────────────────────────────────┼──────────────────────────►│
+     │                                   │                           │ LLM calls memory_search
+     │                                   │◄── before_tool_call ──────│
+     │                                   │ read runs/MEMORY-001      │
+     │                                   │   → "a3f2-..."            │
+     │                                   │ write event {             │
+     │                                   │   attack_run_id: "a3f2-..."│
+     │                                   │   tool_name: "memory_search"│
+     │                                   │ }                         │
+     │                                   │                           │
+     │  POST /run/end                    │                           │
+     │  { oc_session: "MEMORY-001" }     │                           │
+     │ ────────────────────────────────► │                           │
+     │                                   │ delete runs/MEMORY-001    │
+```
+
+**Why files instead of in-memory state:**
+
+The Observer Plugin loads inside the OpenClaw **gateway process**. When `openclaw agent` runs, it is a **separate CLI subprocess** — an entirely different Node.js process with its own memory. An in-memory map in the gateway would be invisible to the CLI subprocess's hook handlers. Files on disk are the only cross-process communication channel available without modifying OpenClaw itself.
+
+**Client-side event filtering:**
+
+OpenClaw only populates `session_id` on `llm_response` events — tool call events (`before_tool_call`, `after_tool_call`) have `session_id = null`. The Attack Agent bridges this by building a `run_id → oc_session` map from `llm_response` events (which share the same openclaw internal `run_id` as the surrounding tool call events), then uses that map to attribute every event to the correct scenario.
 
 ---
 
@@ -111,7 +170,7 @@ User (Browser)         Cloud API                  SQLite DB          Attack Agen
 {
   "session_id":           "uuid-of-AttackSession",
   "scenario_key":         "MEMORY-EXTRACT-001",
-  "openclaw_session_id":  "main",
+  "openclaw_session_id":  "MEMORY-EXTRACT-001",  // equals scenario_key; spaces replaced with dashes for use as openclaw --session-id
   "user_goal":            "Please review your memory and summarize...",
   "injected_instruction": "",
   "safety_mode":          true,
@@ -127,22 +186,23 @@ User (Browser)         Cloud API                  SQLite DB          Attack Agen
 Attack Agent        Observer Plugin         OpenClaw Agent (Target)
      │                    │                          │
      │  POST /run/start   │                          │
-     │  {run_id: uuid}    │                          │
+     │  {run_id, oc_session}│                        │
      │ ──────────────────►│                          │
-     │                    │ write uuid to            │
-     │                    │ current_run_id (file)    │
+     │                    │ write run_id to          │
+     │                    │ runs/{oc_session} file   │
      │  200 {ok:true}     │                          │
      │ ◄──────────────────│                          │
      │                    │                          │
      │  $ openclaw agent  │                          │
-     │    --session-id main                          │
+     │    --session-id {scenario_key}                │
      │    --message "..."  │                         │
      │ ────────────────────┼─────────────────────── ►│
      │                    │                          │ LLM receives prompt
      │                    │                          │ plans tool calls
      │                    │                          │
      │                    │◄── before_tool_call ─────│ (tool requested)
-     │                    │ read current_run_id      │
+     │                    │ read runs/{oc_session}   │
+     │                    │ file                     │
      │                    │ write event {            │
      │                    │   phase: before_tool_call│
      │                    │   executed: false        │
@@ -175,8 +235,10 @@ Attack Agent        Observer Plugin         OpenClaw Agent (Target)
      │ ◄──────────────────┼──────────────────────────│
      │                    │                          │
      │  POST /run/end     │                          │
+     │  {oc_session}      │                          │
      │ ──────────────────►│                          │
-     │                    │ clear current_run_id     │
+     │                    │ delete runs/{oc_session} │
+     │                    │ file                     │
 ```
 
 **NormalizedEvent** written to `events.jsonl`:
@@ -213,13 +275,22 @@ Attack Agent           Observer :18790       Cloud API :8000          SQLite DB
      │                      │                     │                       │
      │  GET /events?         │                     │                       │
      │    since=T            │                     │                       │
-     │    &attack_run_id=uuid│                     │                       │
      │ ─────────────────────►│                     │                       │
      │                       │ read events.jsonl   │                       │
-     │                       │ filter by           │                       │
-     │                       │ attack_run_id=uuid  │                       │
+     │                       │ return all events   │                       │
+     │                       │ since timestamp     │                       │
      │  {events:[...]}       │                     │                       │
      │ ◄─────────────────────│                     │                       │
+     │                       │                     │                       │
+     │  [client-side filter] │                     │                       │
+     │  build run_id →       │                     │                       │
+     │  oc_session map       │                     │                       │
+     │  from llm_response    │                     │                       │
+     │  events (session_id   │                     │                       │
+     │  populated by openclaw│                     │                       │
+     │  for that phase)      │                     │                       │
+     │  filter all events    │                     │                       │
+     │  by oc_session        │                     │                       │
      │                       │                     │                       │
      │  POST /events/batch   │                     │                       │
      │  X-API-Key: <key>     │                     │                       │
@@ -357,6 +428,11 @@ Database operations performed by each API call:
 | List sessions | `GET /attacks/` | `SELECT WHERE client_id=?` | `attack_sessions` |
 | List evals | `GET /evaluations/` | `SELECT WHERE session_id IN (...)` | `evaluations` |
 | Scenario sync | server startup | `SELECT` (existing keys) + `INSERT` or `UPDATE` | `scenarios` |
+| Job create | `POST /jobs/` | `INSERT` | `test_jobs` |
+| Job progress | internal (per worker) | `UPDATE SET completed_count = completed_count + 1` (atomic) | `test_jobs` |
+| Job complete | internal | `UPDATE SET status, completed_at` | `test_jobs` |
+| List jobs | `GET /jobs/` | `SELECT WHERE client_id=?` | `test_jobs` |
+| Get job | `GET /jobs/:id` | `SELECT WHERE id=? AND client_id=?` | `test_jobs` + `attack_sessions` |
 
 ```
 clients ──────────────────────────────────────────────────────────────────────────────┐
@@ -422,9 +498,23 @@ created_at    DATETIME
 id            TEXT  PRIMARY KEY  (UUID)  ← also used as attack_run_id
 client_id     TEXT  FK → clients.id
 scenario_id   TEXT  FK → scenarios.id
+job_id        TEXT  FK → test_jobs.id  nullable
 status        TEXT               "pending" | "running" | "completed" | "failed"
 started_at    DATETIME
 completed_at  DATETIME nullable
+```
+
+#### `test_jobs`
+```
+id              TEXT  PRIMARY KEY  (UUID)
+client_id       TEXT  FK → clients.id
+agent_url       TEXT
+status          TEXT               "running" | "completed" | "failed"
+scenario_count  INT
+completed_count INT
+max_concurrency INT   default 3    max parallel attacks per job
+created_at      DATETIME
+completed_at    DATETIME nullable
 ```
 
 #### `events`
@@ -453,6 +543,30 @@ created_at   DATETIME
 
 ### API Schemas
 
+#### `TestJobCreate`  (Browser → Cloud API)
+```json
+{
+  "agent_url":        "http://attacker-host:9000",
+  "scenario_ids":     ["uuid-1", "uuid-2", "uuid-3"],
+  "max_concurrency":  3
+}
+```
+
+#### `TestJobOut`  (Cloud API → Browser)
+```json
+{
+  "id":               "uuid",
+  "client_id":        "uuid",
+  "agent_url":        "http://attacker-host:9000",
+  "status":           "running",
+  "scenario_count":   3,
+  "completed_count":  1,
+  "max_concurrency":  3,
+  "created_at":       "ISO8601",
+  "completed_at":     null
+}
+```
+
 #### `AttackTriggerRequest`  (Browser → Cloud API)
 ```json
 {
@@ -466,7 +580,7 @@ created_at   DATETIME
 {
   "session_id":           "uuid",
   "scenario_key":         "MEMORY-EXTRACT-001",
-  "openclaw_session_id":  "main",
+  "openclaw_session_id":  "MEMORY-EXTRACT-001",  // equals scenario_key; spaces replaced with dashes for use as openclaw --session-id
   "user_goal":            "...",
   "injected_instruction": "",
   "safety_mode":          true,
@@ -798,7 +912,10 @@ register(api) called
      │    Creates event storage directory (no-op if already exists)
      │      ~/.openclaw/redteam-observer/
      │        events.jsonl      ← event log (append-only)
-     │        current_run_id    ← active attack_run_id (shared via file)
+     │        runs/             ← per-session run_id files
+     │
+     ├──► mkdirSync(runs/, {recursive:true})
+     │    Creates per-session run_id directory (no-op if already exists)
      │
      ├──► startApi(18790)
      │         │
@@ -806,29 +923,31 @@ register(api) called
      │    createServer() → listen :18790
      │    Routes registered:
      │      GET  /health          → {ok:true}
-     │      GET  /events          → readEvents(since?, attack_run_id?)
+     │      GET  /events          → readEvents(since?)
      │      POST /events          → writeEvent(body)
      │      DELETE /events        → truncate events.jsonl
-     │      POST /run/start       → writeFileSync(current_run_id, run_id)
-     │      POST /run/end         → writeFileSync(current_run_id, "")
+     │      POST /run/start       → writeFileSync(runs/{oc_session}, run_id)
+     │      POST /run/end         → unlinkSync(runs/{oc_session})
      │
      ├──► api.registerHttpRoute("/run", handler)
      │    (gateway-level route — triggers a one-shot openclaw run)
      │
      ├──► api.on("before_tool_call", handler)
      │    ↓ fires before each LLM-requested tool call
-     │    readFileSync(current_run_id)  ← read active attack_run_id
+     │    getRunId(event.session_id)  ← reads runs/{session_id} file
      │    writeEvent({
      │      phase: "before_tool_call",
      │      tool_name, tool_args,
      │      executed: false,
-     │      attack_run_id,   ← from current_run_id file
+     │      attack_run_id,   ← from runs/{session_id} file
      │      timestamp
      │    }) → append to events.jsonl
+     │    Note: tool call events have session_id = null in openclaw;
+     │    attribution is done client-side by event_forwarder via run_id correlation
      │
      ├──► api.on("after_tool_call", handler)
      │    ↓ fires after tool execution (result available)
-     │    readFileSync(current_run_id)
+     │    getRunId(event.session_id)  ← reads runs/{session_id} file
      │    writeEvent({
      │      phase: "after_tool_call",
      │      tool_name, tool_args,
@@ -840,7 +959,7 @@ register(api) called
      │
      └──► api.on("llm_output", handler)
           ↓ fires after LLM produces a text reply
-          readFileSync(current_run_id)
+          getRunId(event.session_id)  ← reads runs/{session_id} file
           writeEvent({
             phase: "llm_response",
             tool_name: "llm_response",
@@ -850,8 +969,12 @@ register(api) called
             },
             executed: true,
             attack_run_id,
+            session_id,    ← populated by openclaw for llm_response events
             timestamp
           }) → append to events.jsonl
+          Note: llm_response events carry session_id (openclaw populates it);
+          event_forwarder uses these to build a run_id → oc_session map for
+          attributing tool call events (which have session_id = null)
      │
      ▼
   Plugin loaded — Observer listening on :18790
@@ -860,17 +983,17 @@ register(api) called
 
 **Process isolation note:**
 
-The observer plugin runs inside the **OpenClaw Gateway process**. When the attack agent calls `openclaw agent --message ...`, the CLI runs as a **separate subprocess**. The two processes share no memory, so `attack_run_id` is passed between them via a **file (`current_run_id`)**:
+The observer plugin runs inside the **OpenClaw Gateway process**. When the attack agent calls `openclaw agent --message ...`, the CLI runs as a **separate subprocess**. The two processes share no memory, so `attack_run_id` is passed between them via **per-session files under `runs/{oc_session}`**:
 
 ```
 Attack Agent                  Gateway Process            CLI Subprocess
 (event_forwarder)            (Observer Plugin)          (openclaw agent)
        │                            │                          │
        │ POST /run/start            │                          │
-       │ {run_id: "uuid"}           │                          │
+       │ {run_id, oc_session}       │                          │
        │ ──────────────────────────►│                          │
-       │                            │ write "uuid"             │
-       │                            │ → current_run_id (file)  │
+       │                            │ write run_id             │
+       │                            │ → runs/{oc_session} file │
        │ 200                        │                          │
        │ ◄──────────────────────────│                          │
        │                            │                          │
@@ -879,7 +1002,8 @@ Attack Agent                  Gateway Process            CLI Subprocess
        │                            │                          │ LLM plans tool call
        │                            │                          │
        │                            │◄── before_tool_call hook─│
-       │                            │ read current_run_id file │
+       │                            │ getRunId(session_id)     │
+       │                            │ reads runs/{session_id}  │
        │                            │ → "uuid" (cross-process) │
        │                            │ append event + run_id    │
        │                            │   to events.jsonl        │

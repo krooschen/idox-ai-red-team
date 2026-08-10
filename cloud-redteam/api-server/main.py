@@ -78,6 +78,7 @@ from routers.attacks     import router as attacks_router
 from routers.evaluations import router as evaluations_router
 from routers.events      import router as events_router
 from routers.jobs        import router as jobs_router
+from routers.chat        import router as chat_router
 
 app.include_router(clients_router,     prefix="/api/v1")
 app.include_router(scenarios_router,   prefix="/api/v1")
@@ -85,6 +86,7 @@ app.include_router(attacks_router,     prefix="/api/v1")
 app.include_router(evaluations_router, prefix="/api/v1")
 app.include_router(events_router,      prefix="/api/v1")
 app.include_router(jobs_router,        prefix="/api/v1")
+app.include_router(chat_router,        prefix="/api/v1")
 
 # ── Static (Web UI) ────────────────────────────────────────────────
 STATIC_DIR = Path(__file__).parent / "static"
