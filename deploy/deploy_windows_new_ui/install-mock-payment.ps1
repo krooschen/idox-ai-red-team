@@ -20,11 +20,9 @@ $VenvBin      = if ($IsWin) { 'Scripts' } else { 'bin' }
 
 $ServerSrc    = Join-Path $RepoRoot 'mock-payment-mcp'
 $ServerPy     = Join-Path $ServerSrc 'server.py'
-$TestDataSrc  = Join-Path $ServerSrc 'test-data'
 $VenvPython   = Join-Path (Join-Path $Root 'venv') (Join-Path $VenvBin 'python')
 $OpenclawHome = Join-Path $HOME '.openclaw'
 $OpenclawJson = Join-Path $OpenclawHome 'openclaw.json'
-$TestDataDst  = Join-Path $OpenclawHome 'test-data'
 
 function Write-Step($msg) { Write-Host "[mock-payment] $msg" -ForegroundColor Cyan }
 
@@ -37,11 +35,6 @@ if (-not (Test-Path "$VenvPython*")) {
 }
 if (-not (Test-Path $OpenclawJson)) {
     Write-Error 'openclaw.json not found. Run openclaw at least once first.'
-}
-
-# -- Sanity check: test-data source exists ---------------------------------------
-if (-not (Test-Path $TestDataSrc)) {
-    Write-Error "test-data folder not found at: $TestDataSrc"
 }
 
 # -- Uninstall -------------------------------------------------------------------
@@ -59,7 +52,6 @@ if ($Uninstall) {
     }
     Write-Host ''
     Write-Host '[mock-payment] Uninstalled. Restart openclaw to apply.' -ForegroundColor Green
-    Write-Host '  Note: test-data files in ~/.openclaw/test-data/ are NOT removed.' -ForegroundColor DarkGray
     exit 0
 }
 
@@ -95,15 +87,6 @@ $cfg | ConvertTo-Json -Depth 20 | Set-Content $OpenclawJson -Encoding UTF8
 Write-Host "  Registered: command=$VenvPython"
 Write-Host "              args=$ServerPy"
 
-# -- 3. Copy test-data files to ~/.openclaw/test-data ---------------------------
-Write-Step 'Installing test-data files to ~/.openclaw/test-data/...'
-New-Item -ItemType Directory -Force -Path $TestDataDst | Out-Null
-foreach ($f in Get-ChildItem $TestDataSrc -File) {
-    Copy-Item $f.FullName (Join-Path $TestDataDst $f.Name) -Force
-    Write-Host "  Copied: $($f.Name) -> $TestDataDst"
-}
-
 Write-Host ''
 Write-Host '[mock-payment] Done. Restart openclaw to load the mock-payment MCP server.' -ForegroundColor Green
-Write-Host "  Test data installed at: $TestDataDst" -ForegroundColor DarkGray
 Write-Host '  To uninstall: .\install-mock-payment.ps1 -Uninstall' -ForegroundColor DarkGray

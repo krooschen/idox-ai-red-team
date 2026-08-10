@@ -18,16 +18,7 @@ for src in "$EXTENSIONS_SRC"/*/; do
   cp -r "$src" "$dst"
 done
 
-# # ── 2. Sync mock-payment test-data into config volume ─────────────
-TEST_DATA_SRC=/opt/mock-payment-mcp/test-data
-TEST_DATA_DST=$OPENCLAW_HOME/test-data
-if [ -d "$TEST_DATA_SRC" ]; then
-  mkdir -p "$TEST_DATA_DST"
-  cp -f "$TEST_DATA_SRC"/* "$TEST_DATA_DST"/
-  echo "[entrypoint] Synced test-data: $(ls "$TEST_DATA_DST" | tr '\n' ' ')"
-fi
-
-# ── 3. Create minimal openclaw.json if missing (skip onboarding) ──
+# ── 2. Create minimal openclaw.json if missing (skip onboarding) ──
 if [ ! -f "$OPENCLAW_JSON" ]; then
   echo "[entrypoint] openclaw.json not found — creating minimal config"
   mkdir -p "$OPENCLAW_HOME"
